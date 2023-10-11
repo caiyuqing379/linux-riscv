@@ -918,3 +918,8 @@ void pci_no_msi(void)
 {
 	pci_msi_enable = 0;
 }
+
+void pci_set_msi(void)
+{
+	pci_msi_enable = 1;
+}
