@@ -3,7 +3,7 @@
  * Copyright (C) 2017 SiFive
  * Copyright (C) 2018 Christoph Hellwig
  */
-#include <linux/acpi.h>
+#define pr_fmt(fmt) "plic: " fmt
 #include <linux/cpu.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -70,8 +70,6 @@ struct plic_priv {
 	unsigned long plic_quirks;
 	unsigned int nr_irqs;
 	unsigned long *prio_save;
-	u32 gsi_base;
-	int id;
 };
 
 struct plic_handler {
@@ -325,10 +323,6 @@ static int plic_irq_domain_translate(struct irq_domain *d,
 {
 	struct plic_priv *priv = d->host_data;
 
-	/* For DT, gsi_base is always zero. */
-	if (fwspec->param[0] >= priv->gsi_base)
-		fwspec->param[0] = fwspec->param[0] - priv->gsi_base;
-
 	if (test_bit(PLIC_QUIRK_EDGE_INTERRUPT, &priv->plic_quirks))
 		return irq_domain_translate_twocell(d, fwspec, hwirq, type);
 
@@ -418,117 +412,17 @@ static int plic_starting_cpu(unsigned int cpu)
 	return 0;
 }
 
-static const struct of_device_id plic_match[] = {
-	{ .compatible = "sifive,plic-1.0.0" },
-	{ .compatible = "riscv,plic0" },
-	{ .compatible = "andestech,nceplic100",
-	  .data = (const void *)BIT(PLIC_QUIRK_EDGE_INTERRUPT) },
-	{ .compatible = "thead,c900-plic",
-	  .data = (const void *)BIT(PLIC_QUIRK_EDGE_INTERRUPT) },
-	{}
-};
-
-#ifdef CONFIG_ACPI
-
-static const struct acpi_device_id plic_acpi_match[] = {
-	{ "RSCV0001", 0 },
-	{}
-};
-MODULE_DEVICE_TABLE(acpi, plic_acpi_match);
-
-#endif
-static int plic_parse_nr_irqs_and_contexts(struct platform_device *pdev,
-					   u32 *nr_irqs, u32 *nr_contexts,
-					   u32 *gsi_base, u32 *id)
+static int __init __plic_init(struct device_node *node,
+			      struct device_node *parent,
+			      unsigned long plic_quirks)
 {
-	struct device *dev = &pdev->dev;
-	int rc;
-
-	if (!is_of_node(dev->fwnode)) {
-		riscv_acpi_get_gsi_info(dev->fwnode, gsi_base, id, nr_irqs, NULL);
-		*nr_contexts = acpi_get_plic_nr_contexts(*id);
-		if (WARN_ON(!*nr_contexts)) {
-			dev_err(dev, "no PLIC context available\n");
-			return -EINVAL;
-		}
-
-		return 0;
-	}
-
-	rc = of_property_read_u32(to_of_node(dev->fwnode), "riscv,ndev", nr_irqs);
-	if (rc) {
-		dev_err(dev, "riscv,ndev property not available\n");
-		return rc;
-	}
-
-	*nr_contexts = of_irq_count(to_of_node(dev->fwnode));
-	if (WARN_ON(!(*nr_contexts))) {
-		dev_err(dev, "no PLIC context available\n");
-		return -EINVAL;
-	}
-
-	*gsi_base = 0;
-	*id = 0;
-
-	return 0;
-}
-
-static int plic_parse_context_parent(struct platform_device *pdev, u32 context,
-				     u32 *parent_hwirq, int *parent_cpu, u32 id)
-{
-	struct device *dev = &pdev->dev;
-	struct of_phandle_args parent;
-	unsigned long hartid;
-	int rc;
-
-	if (!is_of_node(dev->fwnode)) {
-		hartid = acpi_get_ext_intc_parent_hartid(id, context);
-		if (hartid == INVALID_HARTID)
-			return -EINVAL;
-
-		*parent_cpu = riscv_hartid_to_cpuid(hartid);
-		*parent_hwirq = RV_IRQ_EXT;
-		return 0;
-	}
-
-	rc = of_irq_parse_one(to_of_node(dev->fwnode), context, &parent);
-	if (rc)
-		return rc;
-
-	rc = riscv_of_parent_hartid(parent.np, &hartid);
-	if (rc)
-		return rc;
-
-	*parent_hwirq = parent.args[0];
-	*parent_cpu = riscv_hartid_to_cpuid(hartid);
-	return 0;
-}
-
-static int plic_probe(struct platform_device *pdev)
-{
-	int error = 0, nr_contexts, nr_handlers = 0, cpu, i;
-	struct device *dev = &pdev->dev;
-	unsigned long plic_quirks = 0;
-	struct plic_handler *handler;
-	u32 nr_irqs, parent_hwirq;
+	int error = 0, nr_contexts, nr_handlers = 0, i;
+	u32 nr_irqs;
 	struct plic_priv *priv;
-	irq_hw_number_t hwirq;
-	int id, context_id;
-	u32 gsi_base;
+	struct plic_handler *handler;
+	unsigned int cpu;
 
-	if (is_of_node(dev->fwnode)) {
-		const struct of_device_id *id;
-
-		id = of_match_node(plic_match, to_of_node(dev->fwnode));
-		if (id)
-			plic_quirks = (unsigned long)id->data;
-	}
-
-	error = plic_parse_nr_irqs_and_contexts(pdev, &nr_irqs, &nr_contexts, &gsi_base, &id);
-	if (error)
-		return error;
-
-	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
@@ -546,8 +440,6 @@ static int plic_probe(struct platform_device *pdev)
 		goto out_iounmap;
 
 	priv->nr_irqs = nr_irqs;
-	priv->gsi_base = gsi_base;
-	priv->id = id;
 
 	priv->prio_save = bitmap_alloc(nr_irqs, GFP_KERNEL);
 	if (!priv->prio_save)
@@ -564,20 +456,14 @@ static int plic_probe(struct platform_device *pdev)
 		goto out_free_priority_reg;
 
 	for (i = 0; i < nr_contexts; i++) {
-		error = plic_parse_context_parent(pdev, i, &parent_hwirq, &cpu, priv->id);
-		if (error) {
-			dev_warn(dev, "hwirq for context%d not found\n", i);
-			continue;
-		}
+		struct of_phandle_args parent;
+		irq_hw_number_t hwirq;
+		int cpu;
+		unsigned long hartid;
 
-		if (is_of_node(dev->fwnode)) {
-			context_id = i;
-		} else {
-			context_id = acpi_get_plic_context(priv->id, i);
-			if (context_id == INVALID_CONTEXT) {
-				dev_warn(dev, "invalid context id for context%d\n", i);
-				continue;
-			}
+		if (of_irq_parse_one(node, i, &parent)) {
+			pr_err("failed to parse parent for context %d.\n", i);
+			continue;
 		}
 
 		/*
@@ -632,10 +518,10 @@ static int plic_probe(struct platform_device *pdev)
 		cpumask_set_cpu(cpu, &priv->lmask);
 		handler->present = true;
 		handler->hart_base = priv->regs + CONTEXT_BASE +
-			context_id * CONTEXT_SIZE;
+			i * CONTEXT_SIZE;
 		raw_spin_lock_init(&handler->enable_lock);
 		handler->enable_base = priv->regs + CONTEXT_ENABLE_BASE +
-			context_id * CONTEXT_ENABLE_SIZE;
+			i * CONTEXT_ENABLE_SIZE;
 		handler->priv = priv;
 
 		handler->enable_save =  kcalloc(DIV_ROUND_UP(nr_irqs, 32),
@@ -651,11 +537,6 @@ done:
 		nr_handlers++;
 	}
 
-	priv->irqdomain = irq_domain_create_linear(dev->fwnode, nr_irqs + 1,
-						   &plic_irqdomain_ops, priv);
-	if (WARN_ON(!priv->irqdomain))
-		goto fail_cleanup_contexts;
-
 	/*
 	 * We can have multiple PLIC instances so setup cpuhp state
 	 * and register syscore operations only when context handler
@@ -670,22 +551,12 @@ done:
 		plic_cpuhp_setup_done = true;
 	}
 
-#ifdef CONFIG_ACPI
-	if (!acpi_disabled)
-		acpi_dev_clear_dependencies(ACPI_COMPANION(dev));
-#endif
-
-	dev_info(dev, "mapped %d interrupts with %d handlers for %d contexts.\n",
-		 nr_irqs, nr_handlers, nr_contexts);
+	pr_info("%pOFP: mapped %d interrupts with %d handlers for"
+		" %d contexts.\n", node, nr_irqs, nr_handlers, nr_contexts);
 	return 0;
 
-fail_cleanup_contexts:
-	for (i = 0; i < nr_contexts; i++) {
-		if (plic_parse_context_parent(pdev, i, &parent_hwirq, &cpu, priv->id))
-			continue;
-		if (parent_hwirq != RV_IRQ_EXT || cpu < 0)
-			continue;
-
+out_free_enable_reg:
+	for_each_cpu(cpu, cpu_present_mask) {
 		handler = per_cpu_ptr(&plic_handlers, cpu);
 		kfree(handler->enable_save);
 	}
@@ -698,12 +569,20 @@ out_free_priv:
 	return error;
 }
 
-static struct platform_driver plic_driver = {
-	.driver = {
-		.name		= "riscv-plic",
-		.of_match_table	= plic_match,
-		.acpi_match_table = ACPI_PTR(plic_acpi_match),
-	},
-	.probe = plic_probe,
-};
-builtin_platform_driver(plic_driver);
+static int __init plic_init(struct device_node *node,
+			    struct device_node *parent)
+{
+	return __plic_init(node, parent, 0);
+}
+
+IRQCHIP_DECLARE(sifive_plic, "sifive,plic-1.0.0", plic_init);
+IRQCHIP_DECLARE(riscv_plic0, "riscv,plic0", plic_init); /* for legacy systems */
+
+static int __init plic_edge_init(struct device_node *node,
+				 struct device_node *parent)
+{
+	return __plic_init(node, parent, BIT(PLIC_QUIRK_EDGE_INTERRUPT));
+}
+
+IRQCHIP_DECLARE(andestech_nceplic100, "andestech,nceplic100", plic_edge_init);
+IRQCHIP_DECLARE(thead_c900_plic, "thead,c900-plic", plic_edge_init);
